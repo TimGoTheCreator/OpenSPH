@@ -1,7 +1,5 @@
----
 name: CMake
 
-# yamllint disable-line rule:truthy
 on:
   push:
     branches:
@@ -15,11 +13,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
-    # We want to build all combinations on ubuntu-latest to verify it works
-    # Additionally, we want to build versions with newer dependencies based
-    # on the VFX Reference platforms CY2021+
     strategy:
       fail-fast: false
       matrix:
@@ -27,11 +22,11 @@ jobs:
         with_vdb: ["ON", "OFF"]
         with_eigen: ["ON", "OFF"]
         with_tbb: ["ON", "OFF"]
-        with_chaiscript: ["OFF"]  # TODO: Chaiscript support needs to be added
+        with_chaiscript: ["OFF"]
         use_single_precision: ["OFF"]
         container: [""]
+
         include:
-          # Build everything with single precision
           - container: ""
             build_type: "Debug"
             with_vdb: "ON"
@@ -39,7 +34,7 @@ jobs:
             with_tbb: "ON"
             with_chaiscript: "OFF"
             use_single_precision: "ON"
-          # Build a modern version of OpenSPH based on VFX Reference Platforms
+
           - container: aswf/ci-vfxall:2021
             build_type: "Release"
             with_vdb: "ON"
@@ -47,6 +42,7 @@ jobs:
             with_tbb: "ON"
             with_chaiscript: "OFF"
             use_single_precision: "OFF"
+
           - container: aswf/ci-vfxall:2022
             build_type: "Release"
             with_vdb: "ON"
@@ -58,45 +54,120 @@ jobs:
     container: ${{ matrix.container }}
 
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install GTK3 wxWidgets
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qy && sudo apt-get install -y --no-install-recommends libwxgtk3.0-gtk3-dev || yum install -y --setopt=tsflags=nodocs wxGTK3-devel
+      - name: Install dependencies
+        shell: bash
+        env:
+          WITH_EIGEN: ${{ matrix.with_eigen }}
+          WITH_TBB: ${{ matrix.with_tbb }}
+          WITH_VDB: ${{ matrix.with_vdb }}
+          CI_CONTAINER: ${{ matrix.container }}
+        run: |
+          set -euo pipefail
 
-      - name: Install Eigen3
-        if: runner.os == 'Linux' && matrix.with_eigen == 'ON'
-        run: sudo apt-get install -y --no-install-recommends libeigen3-dev || yum install -y --setopt=tsflags=nodocs eigen3-devel
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=()
+          else
+            SUDO=(sudo)
+          fi
 
-      - name: Install TBB
-        # TBB is pre-installed on VFX Reference platform containers
-        if: runner.os == 'Linux' && matrix.with_tbb == 'ON' && matrix.container == ''
-        run: sudo apt-get install -y --no-install-recommends libtbb-dev
+          if command -v apt-get >/dev/null 2>&1; then
+            "${SUDO[@]}" apt-get update -qy
 
-      - name: Install OpenVDB and dependencies
-        # OpenVDB is pre-installed on VFX Reference platform containers
-        if: runner.os == 'Linux' && matrix.with_vdb == 'ON' && matrix.container == ''
-        run: sudo apt-get install -y --no-install-recommends libopenvdb-dev libboost-iostreams-dev libboost-system-dev
+            if apt-cache show libwxgtk3.2-dev >/dev/null 2>&1; then
+              WX_PACKAGE=libwxgtk3.2-dev
+            elif apt-cache show libwxgtk3.0-gtk3-dev >/dev/null 2>&1; then
+              WX_PACKAGE=libwxgtk3.0-gtk3-dev
+            else
+              echo "No supported wxWidgets development package found"
+              exit 1
+            fi
+
+            PACKAGES=(
+              "$WX_PACKAGE"
+              libhdf5-dev
+            )
+
+            if [ "$WITH_EIGEN" = "ON" ]; then
+              PACKAGES+=(libeigen3-dev)
+            fi
+
+            if [ -z "$CI_CONTAINER" ]; then
+              if [ "$WITH_TBB" = "ON" ]; then
+                PACKAGES+=(libtbb-dev)
+              fi
+
+              if [ "$WITH_VDB" = "ON" ]; then
+                PACKAGES+=(
+                  libopenvdb-dev
+                  libboost-iostreams-dev
+                  libboost-system-dev
+                )
+              fi
+            fi
+
+            "${SUDO[@]}" apt-get install -y \
+              --no-install-recommends "${PACKAGES[@]}"
+
+          elif command -v dnf >/dev/null 2>&1; then
+            PACKAGES=(wxGTK3-devel)
+
+            if [ "$WITH_EIGEN" = "ON" ]; then
+              PACKAGES+=(eigen3-devel)
+            fi
+
+            "${SUDO[@]}" dnf install -y "${PACKAGES[@]}"
+
+          elif command -v yum >/dev/null 2>&1; then
+            PACKAGES=(wxGTK3-devel)
+
+            if [ "$WITH_EIGEN" = "ON" ]; then
+              PACKAGES+=(eigen3-devel)
+            fi
+
+            "${SUDO[@]}" yum install -y \
+              --setopt=tsflags=nodocs \
+              "${PACKAGES[@]}"
+
+          else
+            echo "Unsupported package manager"
+            exit 1
+          fi
 
       - name: Configure CMake
-        # `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
-        # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ matrix.build_type }}
+          WITH_VDB: ${{ matrix.with_vdb }}
+          WITH_EIGEN: ${{ matrix.with_eigen }}
+          WITH_TBB: ${{ matrix.with_tbb }}
+          WITH_CHAISCRIPT: ${{ matrix.with_chaiscript }}
+          SINGLE_PRECISION: ${{ matrix.use_single_precision }}
+          CI_CONTAINER: ${{ matrix.container }}
         run: |
-          cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE:STRING=${{ matrix.build_type }} \
-          -DUSE_SINGLE_PRECISION=${{ matrix.use_single_precision }} \
-          -DWITH_EIGEN:STRING=${{ matrix.with_eigen }} \
-          -DWITH_CHAISCRIPT:STRING=${{ matrix.with_chaiscript }} \
-          -DWITH_VDB:STRING=${{ matrix.with_vdb }} \
-          -DWITH_TBB:STRING=${{ matrix.with_tbb }} \
-          -DBUILD_UTILS=ON
+          set -euo pipefail
+
+          if [ -z "$CI_CONTAINER" ]; then
+            HDF5=ON
+          else
+            HDF5=OFF
+          fi
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+            -DUSE_SINGLE_PRECISION="$SINGLE_PRECISION" \
+            -DWITH_EIGEN="$WITH_EIGEN" \
+            -DWITH_CHAISCRIPT="$WITH_CHAISCRIPT" \
+            -DWITH_VDB="$WITH_VDB" \
+            -DWITH_TBB="$WITH_TBB" \
+            -DWITH_HDF5="$HDF5" \
+            -DBUILD_UTILS=ON
 
       - name: Build
-        # Build your program with the given configuration
-        run: cmake --build ${{github.workspace}}/build --config ${{ matrix.build_type }} -j4
-
-      - name: Test
-        if: ${{ false }}  # Skip tests until they work properly
-        working-directory: ${{github.workspace}}/build
-        # Execute tests defined by the CMake configuration.
-        # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-        run: ctest -C ${{ matrix.build_type }}
+        shell: bash
+        run: |
+          cmake --build build \
+            --config "${{ matrix.build_type }}" \
+            --parallel 4
